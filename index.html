@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8" />
 <title>OrderFlowMap · Bookmap-style Visualizer</title>
-<script src="https://cdn.jsdelivr.net/npm/lightweight-charts@5.0.9/dist/lightweight-charts.standalone.production.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/lightweight-charts@5.0.9/dist/lightweight-charts.standalone.production.js" integrity="sha384-6/iv/tWhS2LqjhNmDWcisQfhsuS0IqxtaOo1ZnA8dzgpK1sYsn8Al1icSvt0qirp" crossorigin="anonymous"></script>
 <style>
   :root{
     --bg:#080b10; --panel:#0e131b; --panel2:#131923; --border:#1c2533;
@@ -490,6 +490,9 @@ const clamp = (x,a,b) => x<a?a:(x>b?b:x);
 const mix   = (a,b,t) => [a[0]+(b[0]-a[0])*t, a[1]+(b[1]-a[1])*t, a[2]+(b[2]-a[2])*t];
 const rgba  = (c,a)   => `rgba(${c[0]|0},${c[1]|0},${c[2]|0},${a})`;
 const roundTick = p => Math.round(p/TICK)*TICK;
+// DOM builder used by renderDOM/renderTape/crosshair instead of innerHTML, so
+// feed-supplied values (qty/orders/price from the WebSocket) can never inject markup.
+const el = (tag, cls, txt) => { const n=document.createElement(tag); if(cls) n.className=cls; if(txt!==undefined) n.textContent=txt; return n; };
 function rng(){ return Math.random(); }
 function gauss(){ let u=0,v=0; while(u===0)u=rng(); while(v===0)v=rng();
   return Math.sqrt(-2*Math.log(u))*Math.cos(2*Math.PI*v); }
@@ -1059,6 +1062,14 @@ function connectLive(){
   setConnStatus('wait','Connecting…');
   connLog(`Connecting to ${url}…`);
 
+  // Security: refuse silent plaintext auth to a remote host. ws:// to
+  // localhost/loopback is fine (OpenAlgo proxy default); anything else would
+  // send the API key unencrypted.
+  if(url.startsWith('ws://') && !/127\.0\.0\.1|localhost/.test(url)) {
+    connLog('Warning: ws:// (non-TLS) to non-localhost is insecure. Use wss://', 'err');
+    if(!confirm('Server is not localhost and not using TLS (wss://). API key will be sent in plaintext. Continue?')) return;
+  }
+
   try {
     liveWs = new WebSocket(url);
   } catch(e) {
@@ -1066,6 +1077,12 @@ function connectLive(){
     setConnStatus('err','Connection failed');
     return;
   }
+
+  // Keepalive: detect a silently dropped socket (no FIN/RST) within ~30s
+  // instead of hanging on a stale "Streaming" status forever.
+  liveWs._pingInterval = setInterval(()=>{
+    if(liveWs && liveWs.readyState === 1) liveWs.send(JSON.stringify({action:'ping'}));
+  }, 30000);
 
   liveWs.onopen = () => {
     connLog('WebSocket connected, authenticating…','ok');
@@ -1138,6 +1155,7 @@ function connectLive(){
   };
 
   liveWs.onclose = (e) => {
+    if(liveWs && liveWs._pingInterval) clearInterval(liveWs._pingInterval);
     connLog(`Disconnected (code ${e.code})`,'err');
     setConnStatus('off','Disconnected');
     document.getElementById('liveDot').className = 'live off';
@@ -1148,6 +1166,7 @@ function connectLive(){
 
 function disconnectLive(){
   if(liveWs){
+    if(liveWs._pingInterval) clearInterval(liveWs._pingInterval);
     try { liveWs.close(); } catch(e){}
     liveWs = null;
   }
@@ -1421,8 +1440,9 @@ function updateUI(){
 function renderDOM(){
   const d = depth[depth.length-1];
   const root = document.getElementById('dom');
+  root.textContent = '';
   if(!d || (d.bids.length === 0 && d.asks.length === 0)){
-    root.innerHTML = '<div class="empty-dom">Waiting for depth data…</div>';
+    root.appendChild(el('div','empty-dom','Waiting for depth data…'));
     return;
   }
 
@@ -1436,37 +1456,56 @@ function renderDOM(){
   const cross = window._crossPx;
   const decimals = TICK < 0.1 ? 2 : (TICK < 1 ? 1 : 0);
 
-  let html = `<div class="head"><div>Bid Qty</div><div>Price</div><div>Ask Qty</div></div>`;
+  // Qty cell: "<qty><span class="ord">×<orders></span>"
+  const qtyCell = (cls, lv) => {
+    const c = el('div', cls);
+    c.appendChild(document.createTextNode(lv.q.toLocaleString()));
+    c.appendChild(el('span','ord','×'+lv.o));
+    return c;
+  };
+  const clsOf = (...parts) => parts.filter(Boolean).join(' ');
+
+  const head = el('div','head');
+  head.appendChild(el('div',null,'Bid Qty'));
+  head.appendChild(el('div',null,'Price'));
+  head.appendChild(el('div',null,'Ask Qty'));
+  root.appendChild(head);
+
   asksDesc.forEach((lv,i)=>{
     const w=(lv.q/maxQ)*48;
     const isBest = i===asksDesc.length-1;
     const isCross = cross && Math.abs(cross-lv.p)<TICK*0.5;
-    html += `<div class="lvl ${isBest?'best ask':''} ${isCross?'cross':''}">
-      <div></div>
-      <div class="px">${lv.p.toFixed(decimals)}</div>
-      <div class="askc">${lv.q.toLocaleString()}<span class="ord">×${lv.o}</span></div>
-      <div class="bar ask" style="width:${w}%"></div>
-    </div>`;
+    const row = el('div', clsOf('lvl', isBest?'best ask':'', isCross?'cross':''));
+    row.appendChild(el('div'));
+    row.appendChild(el('div','px',lv.p.toFixed(decimals)));
+    row.appendChild(qtyCell('askc', lv));
+    const bar = el('div','bar ask'); bar.style.width = w+'%';
+    row.appendChild(bar);
+    root.appendChild(row);
   });
 
   // Spread row
   const spreadVal = (asksDesc.length > 0 && bidsDesc.length > 0)
     ? (asksDesc[asksDesc.length-1].p - bidsDesc[0].p).toFixed(decimals)
     : '—';
-  html += `<div class="lvl spread"><div></div><div class="px">↕ ${spreadVal}</div><div></div></div>`;
+  const spreadRow = el('div','lvl spread');
+  spreadRow.appendChild(el('div'));
+  spreadRow.appendChild(el('div','px','↕ '+spreadVal));
+  spreadRow.appendChild(el('div'));
+  root.appendChild(spreadRow);
 
   bidsDesc.forEach((lv,i)=>{
     const w=(lv.q/maxQ)*48;
     const isBest = i===0;
     const isCross = cross && Math.abs(cross-lv.p)<TICK*0.5;
-    html += `<div class="lvl ${isBest?'best bid':''} ${isCross?'cross':''}">
-      <div class="bidc">${lv.q.toLocaleString()}<span class="ord">×${lv.o}</span></div>
-      <div class="px">${lv.p.toFixed(decimals)}</div>
-      <div></div>
-      <div class="bar bid" style="width:${w}%"></div>
-    </div>`;
+    const row = el('div', clsOf('lvl', isBest?'best bid':'', isCross?'cross':''));
+    row.appendChild(qtyCell('bidc', lv));
+    row.appendChild(el('div','px',lv.p.toFixed(decimals)));
+    row.appendChild(el('div'));
+    const bar = el('div','bar bid'); bar.style.width = w+'%';
+    row.appendChild(bar);
+    root.appendChild(row);
   });
-  root.innerHTML = html;
 }
 
 /* ==================== TAPE ==================== */
@@ -1474,15 +1513,18 @@ function renderTape(){
   const root = document.getElementById('tapeBody');
   if(!root) return;
   const recent = trades.slice(-80).reverse();
-  if(!recent.length){ root.innerHTML = '<div class="empty">Waiting for prints…</div>'; return; }
+  root.textContent = '';
+  if(!recent.length){ root.appendChild(el('div','empty','Waiting for prints…')); return; }
   const decimals = TICK < 0.1 ? 2 : (TICK < 1 ? 1 : 0);
-  let html='';
   for(const t of recent){
-    const cls = (t.side==='B'?'buy':'sell') + (t.qty>=ui.largeQty?' large':'');
+    const cls = 't ' + (t.side==='B'?'buy':'sell') + (t.qty>=ui.largeQty?' large':'');
     const time = new Date(t.time*1000).toLocaleTimeString('en-IN',{hour12:false,hour:'2-digit',minute:'2-digit',second:'2-digit'});
-    html += `<div class="t ${cls}"><div>${time}</div><div>${t.price.toFixed(decimals)}</div><div>${t.qty.toLocaleString()}</div></div>`;
+    const row = el('div', cls);
+    row.appendChild(el('div',null,time));
+    row.appendChild(el('div',null,t.price.toFixed(decimals)));
+    row.appendChild(el('div',null,t.qty.toLocaleString()));
+    root.appendChild(row);
   }
-  root.innerHTML = html;
 }
 
 /* ==================== COLOR BAR ==================== */
@@ -1521,17 +1563,21 @@ chart.subscribeCrosshairMove(param => {
     if(depth[i].time<=param.time){ snap=depth[i]; break; }
   }
   const decimals = TICK < 0.1 ? 2 : (TICK < 1 ? 1 : 0);
-  let html = `<b>${price.toFixed(decimals)}</b> @ ${new Date(param.time*1000).toLocaleTimeString('en-IN',{hour12:false})}`;
+  xinfo.textContent = '';
+  xinfo.appendChild(el('b',null,price.toFixed(decimals)));
+  xinfo.appendChild(document.createTextNode(' @ '+new Date(param.time*1000).toLocaleTimeString('en-IN',{hour12:false})));
   if(snap){
     let best=null, bestD=Infinity;
     for(const lv of snap.bids){ const dd=Math.abs(lv.p-price); if(dd<bestD){bestD=dd; best={...lv,side:'bid'};} }
     for(const lv of snap.asks){ const dd=Math.abs(lv.p-price); if(dd<bestD){bestD=dd; best={...lv,side:'ask'};} }
     if(best && bestD<TICK*LEVEL_SPACE*1.2){
       const c = best.side==='bid'?'#7fdcd0':'#ffb4b1';
-      html += ` · <span style="color:${c}">${best.side.toUpperCase()} ${best.q.toLocaleString()} (${best.o} ord)</span>`;
+      xinfo.appendChild(document.createTextNode(' · '));
+      const s = el('span',null,`${best.side.toUpperCase()} ${best.q.toLocaleString()} (${best.o} ord)`);
+      s.style.color = c;
+      xinfo.appendChild(s);
     }
   }
-  xinfo.innerHTML = html;
   xinfo.style.display='block';
   window._crossPx = roundTick(price);
   renderDOM();
